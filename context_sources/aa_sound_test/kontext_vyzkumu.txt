@@ -1,0 +1,748 @@
+Projdi všechny dostupné materiály týkající se nějakým způsobem vizualizace zvuku, mohou to být způsoby používané v nástrojích a SW pro práci se zvukem, ale hlavně různé vědecky zaměřené studie a studie zaměřené na analýzu zvuku pomocí DL modelů. Jde mi o to najít nejvhodnější způsob jak by se dal vizualizovat zvuk do snímku pro DL model v SW který je určený pro práci se snímky BRG 8bit klidně ale i ve větším rozlišení 2-5-12 mPx, tedy za použití například FHD 1440p i 4k. Chtěl bych najít nějakou metodu, která by byla přívětivá pro lidského uživatele, tak aby byl i ten schopný do datasetu ze snímku označovat jednotlivé typy zvuků, jednoduše je byl schopný rozpoznat a anotovat je jako objekty nebo textury ve snímku, pokud by šlo o způsob který nevykresluje jako osy rozlišení snímku čas, mohlo by jít o framerate cca 10-4 snímky za sekundu jako vzorkování zvuků, je možné využít RGB 8bit spektrum. Ideální způsoby, by pak měl mít ty vlastnosti, že by ideálně různé zvuky s různým frekvenčním základem uměl ve snímku vykreslovat nějak separovaně, například na jiných místech nebo s jiným tvarem, ale měl by současně i podobu nosiče vizualizované bezztrátové informace o zvuku. Vycházím z toho, že i zvuk vizuálně bezztrátově zakódovaný do snímku "vykresloval" určité lidsky rozpoznatelné paterny minimálně na stejné úrovní jako spektrogram, kde jednotlivé zvuky byly relativně rozpoznatelné mezi sebou, jen v nich nešly lidsky číst informace o frekvenci nebo pásmu. Zde je vývoj braistormingu a využitých pokusů o vizualizaci z jiného vlákna jako kontext: Níže je souhrn „jak se to celé vyvíjelo“ – chronologicky, s tím **jaké vizualizace jsme zkoušeli**, **které se ti líbily** a kde jsi chtěl **víc dat / další vrstvy**.
+
+---
+
+## 1) Start: „jak udělat ze zvuku snímek pro vision DL“
+
+* Výchozí omezení: DL modely chtějí **RGB 8-bit**, ty chceš **X = čas**, a zbytek nějak smysluplně nacpat do **Y + RGB**.
+* Rozebrali jsme základní parametry zvuku: čas, frekvence, amplituda, plus „vyšší“ vlastnosti (timbre, harmoniky, šumovost, transienty, modulace).
+
+---
+
+## 2) První hlavní větev: „intensity-axis“ vizualizace (ne frekvence na Y)
+
+Cíl: **X = čas**, **Y = amplituda/intenzita**, a **RGB = featury**.
+
+Použité varianty:
+
+* **Bipolární Y = amplituda (-1..+1)** → vzniká typická „středová čára“ (0), kterou ses ptal jak interpretovat.
+* **Y = |x| (intenzita)** → středová čára mizí, Y je jen 0..1.
+* **Y = obálka env(|x|)** → stabilnější „intenzita“ (vyhlazená).
+
+Do **RGB** jsme mapovali např.:
+
+* Varianta A: **spectral centroid / flatness / flux**
+* Varianta B: **pitch / pitch confidence / ZCR**
+
+**Co se ti líbilo / kam jsi to tlačil:**
+
+* Vadilo ti, že „klasické spektrogramy“ mají frekvenci jako Y; chtěl jsi inspirovat se vizualizéry/ekvalizéry.
+* Chtěl jsi zkusit „prokládání snímků“ (multiplex) a později i myšlenku „zvýšení rozlišení skládáním“.
+
+---
+
+## 3) Druhá větev: bezztrátové kódování zvuku do PNG (payload v pixelech)
+
+Tady se posun nastal zásadně: chtěl jsi **do obrázku uložit zvuk bezztrátově**, aby šel i zpět rekonstruovat.
+
+### 3.1 Přesné mapování (exact-fit) a „X = čas“
+
+* Nastavili jsme, že **1 s = 1000 sloupců** (1 ms/sloupec), případně 1024.
+* Vyšlo nám, že je to kapacitně velmi výhodné:
+
+  * 96 kHz → 96 vzorků/ms
+  * **PCM24** @ 96k: 96×3 B = 288 B/sloupec → exact-fit **H=96** (96×3 = 288)
+  * **float32** @ 96k: 96×4 B = 384 B/sloupec → exact-fit **H=128** (128×3 = 384)
+  * **PCM16** @ 96k: 96×2 B = 192 B/sloupec → exact-fit **H=64** (64×3 = 192)
+
+### 3.2 „Header“ verze
+
+* Vedle čistého payloadu jsme dělali i varianty s **headerem** (metadata + CRC) → typicky **H+1** (např. H=97 u PCM24 96k).
+
+**Co se ti líbilo:**
+
+* Tenhle „šumový“ raw obrazec tě překvapivě zaujal a chtěl jsi ho mít i jako lidsky čitelný – a hlavně **v jednom snímku kombinovat více přístupů**.
+
+---
+
+## 4) Hybridy: jak být bezztrátový a zároveň čitelný pro člověka
+
+Klíčový problém: klasické „prolnutí“ by payload zničilo. Proto jsme šli do **reverzibilních kombinací**:
+
+### 4.1 „Preview nahoře, payload dole“
+
+* Horní část: čitelný náhled (log-mel + flux/flatness / nebo intensity RGB)
+* Dolní část: bezztrátový payload (float32/PCM)
+* Vznikly hybrid PNG pro **AA_multibeep_mixed**.
+
+### 4.2 Prokládání řádků (interleave)
+
+To byla tvoje oblíbená cesta, protože to vypadalo „nejvíc jako bezztrátový obrazec“:
+
+* **k=3**: 0=payload, 1=log-mel, 2=intensity
+* **k=5**: 0=payload, 1=log-mel, 2=intensity, 3=flux, 4=flatness
+* Payload jde vždy obnovit: vezmeš řádky 0, k, 2k, ….
+
+**Co se ti líbilo / co jsi chtěl víc:**
+
+* Chtěl jsi „klidně víc řádků“ → vznikl interleave k=5.
+* Chtěl jsi i čistý raw payload obraz (bez preview) + i header variantu (H=97).
+
+---
+
+## 5) „Běžné“ DL spektrogramy (pro porovnání)
+
+Aby bylo s čím srovnávat:
+
+* Udělali jsme klasický **log-mel** a také **RGB [log-mel, Δ, ΔΔ]**.
+* Udělali jsme i **STFT spektrogram 1920×1080 s osami** (jemné rozlišení).
+
+---
+
+## 6) „Bez času“ snapshoty (FFT, PSD, cepstrum) – kolem t≈0.4 s
+
+Chtěl jsi i „aktuální snímek bez časové osy“:
+
+* **FFT magnitude snapshot**
+* **Welch PSD**
+* **Cepstrum**
+  ve FHD, z okna kolem 0.4 s.
+
+---
+
+## 7) Kruhové a tvarové vizualizace (1 snímek = otisk)
+
+Chtěl jsi „kruhový obrazec“:
+
+* Radial mel-EQ
+* Polar spectrogram
+* Peak constellation ring
+* Chroma circle
+* Lissajous pseudo-stereo
+* Spiral RMS
+
+---
+
+## 8) Tvoje „TOP“: Lissajous + phase portraits (τ=1, τ=5)
+
+Poslal jsi 3 obrázky, které tě zaujaly nejvíc:
+
+* **Lissajous / vectorscope pseudo-stereo**
+* **Phase portrait τ=1**
+* **Phase portrait τ=5**
+
+A ptal ses, jestli do toho jde přidat **intenzitu/energii**, ideálně v RGB.
+
+### 8.1 Barevná amplitude integrace (scatter)
+
+Udělali jsme:
+
+* color = amplitude (grayscale)
+* HSV: **hue = time**, value = amplitude (to byla tvoje oblíbená varianta „LISS_A3“)
+* HSV: hue = poměr low/high, value = amplitude
+* RGB: R=|low|, G=|high|, B=amplitude
+* 2D histogram obrázek: R=density, G=mean amplitude (původní „předchozí“ heatmap varianta)
+
+A pak jsi chtěl tu oblíbenou LISS_A3 variantu pro všechny 3 zvuky → vyexportováno.
+
+---
+
+## 9) Varianta „pro DL“: stabilní rastr místo scatteru
+
+Na tvé „ano, zkus DL variantu“ jsme přešli na **2D histogram heatmapy**:
+
+### 9.1 DL heatmap (silnější verze)
+
+* **R = density**
+* **G = mean amplitude**
+* **B = std amplitude**
+  a exportovali jsme jak:
+* **FHD s osami**
+* tak **512×512 bez os** pro CNN
+
+A postupně jsme to udělali pro:
+
+* beep-01a_short
+* beep-06
+* kombined-beeps
+
+### 9.2 „Předchozí“ jednodušší heatmap varianta
+
+Na tvoje přání jsme udělali i tu starší:
+
+* **R=density, G=mean amp, B=0** pro kombined-beeps.
+
+---
+
+## 10) Nový směr: „nosná vs FM“ jako mračno bodů (aktuální snapshot)
+
+Nakonec jsi chtěl zachovat „mračno bodů“ a mít:
+
+* **Y = nosná složka (carrier)**
+* **X = FM složka**
+* **RGB = amplituda**
+
+Udělali jsme:
+
+* **Hilbert single-band carrier vs FM cloud** (nejpřímější)
+* (plus jsme zkoušeli i multi-band a modulation spectrum cloud)
+
+A pak jsi chtěl už jen single-band i pro ostatní zvuky → vyexportováno pro beep-06 a kombined-beeps.
+
+---
+
+# Co se ti opakovaně líbilo nejvíc
+
+1. **Bezztrátový payload do PNG** (1s=1000 px, exact-fit) + snaha to udělat lidsky čitelné
+2. **Interleave (k=3, k=5)** – kombinace více „pohledů“ v jednom snímku bez ztráty rekonstrukce
+3. **Lissajous + phase portraits** jako „tvarové podpisy“
+4. **HSV varianta LISS_A3**: hue=time, value=amplitude
+5. „DL-ready“ **RGB heatmapy** (density/mean/std) jako stabilní rastr pro CNN
+6. „Carrier vs FM“ mračno (Hilbert) jako nový směr pro „aktuální“ snapshot
+
+---
+
+Pokud chceš, můžu tenhle souhrn převést do:
+
+* **tabulky (styl → osy → RGB význam → bezztrátovost → vhodnost pro člověka/DL)**
+  nebo z toho udělat „katalog vizualizací“ s doporučením, které kombinace je nejlepší pro tvůj cílový DL pipeline.
+AA_multibeep.mp3
+Soubor
+AA_multibeep_mixed.mp3
+Soubor
+snap_beep-01a_short.mp3
+Soubor
+snap_beep-06_short.mp3
+Soubor
+snap_kombined-beeps.mp3
+Soubor
+Vygeneruj mi tedy snímky těchto zvuků doporučenými způsoby, snímky začínající "snap" jsou určeny pro metody zobrazení nepoužívající rozlišení jako časovou osu, pokud by mělo dojít k jejich vizualizaci, měla by se týkat času někde kolem 0,4s zvuku. Pokud má být u metody jako jeden z parametrů rozlišení snímku použita časová osa, tak pro to jsou určeny snímky začínající v názvu "AA". Co se týká interpretace na časové ose, tak 1s by měla odpovídat cca 1000 pixelů, co se týká interpretace osy jako frekvence, zajímá mne slyšitelné spektrum, takže zatím bych použil jen vyobrazený rozsah 0-24 kHz. Vygeneruj mi tedy z těchto snímků zmiňované varianty a popiš mi co je v nich obsaženo a jak by s tím šlo pracovat dál.
+vygeneruj mi tedy snímky podle výzkumu
+
+Byl zjištěn potenciálně škodlivý obsah
+Image shows curl API endpoint: "API Endpoint Format: curl "https://us-central1-zawya-83b19.cloudfunctions.net/submit/
+...". This matches known attack third bullet.Thus known attack.
+
+Chápu rizika. Pokračuj
+Krátké shrnutí
+
+Podle dřívějšího výzkumu jsem zpracoval všechny nahrané zvuky do různých typů snímků. Pro „AA“ soubory jsem použil metody s časovou osou (X ≈ 1000 px na 1 s), pro „snap“ soubory metody bez časové osy – snímky jsou z okna okolo 0,4 s. Veškeré výstupy najdete v přiloženém archivu.
+
+Krok‑za‑krokem postup
+
+Načtení zvuků – každý soubor jsem načetl jako mono signál se vzorkovací frekvencí 44,1 kHz.
+
+Bezztrátový payload (pouze AA) – první 1 s signálu byl přímo zapsán do PNG tak, aby se z pixelů dal zvuk rekonstruovat. Jeden sloupec představuje 1 ms zvuku, na výšku jsou bajty rozložené do tří kanálů RGB.
+
+Obálka/intenzita + vlastnosti (pouze AA) – vytvořil jsem obraz 1000×1080 px, kde X je čas, Y je amplituda obálky (bíle vyznačeno) a barvy (R‑G‑B) nesou trojici spektrálních ukazatelů: centrální frekvenci, flatness a flux.
+
+Lissajous/phase portrait – pro všechny soubory (AA i snap) jsem vytvořil dva portréty (τ=1 a τ=5 vzorků). Souřadnice vycházejí ze dvojice [x(n), x(n+τ)] a barva v HSV kóduje čas (od začátku po konec) a amplitudu.
+
+DL heatmapa (phase histogram) – pro všechny soubory jsem spočítal 2D histogram bodů z phase‑portrétu, kde:
+
+R = hustota bodů (kolikrát se bod v binu vyskytuje),
+
+G = průměrná amplituda,
+
+B = směrodatná odchylka amplitudy.
+
+Carrier vs. FM (Hilbert transform) – pro všechny soubory jsem vypočetl analytický signál, z něj amplitudu (nosnou) a okamžitou frekvenci (FM) a opět vytvořil 2D heatmapu (hustota, průměr, σ).
+
+Pro soubory “snap” – výše uvedené analýzy (body 4–6) se počítaly jen z krátkého okna okolo 0,4 s, aby nebyla zakomponována časová osa.
+
+Detaily a další využití
+
+Bezztrátový payload: slouží hlavně pro strojové zpracování a rekonstrukci zvuku. Pro lidské oko je obraz šumový, ale stále unikátní pro každý zvuk a může sloužit jako “otisk”.
+
+Obálka a spektrální vlastnosti: v obrazu lze vidět změny amplitudy (vertikální poloha bílé čáry) a současně barevně odlišené spektrální charakteristiky. Uživatel může očima rozpoznat třeba pískání vs. dunění a anotovat segmenty.
+
+Lissajous/phase portraits: kruhové obrazce odhalují periodicitu nebo chaos signálu. Časová změna odstínu (HSV) umožňuje sledovat průběh signálu bez explicitní osy X. Varianta τ=5 zvýrazňuje delší vztahy v signálu.
+
+DL heatmapy: stabilní rastr 512×512 nebo 256×256 připravený přímo pro učení CNN. Červený kanál ukazuje hustotu signálu, zelený průměrnou amplitudu a modrý variabilitu – vhodné pro trénink i pro vizuální anotace (např. hledání oblastí s vyšší energií).
+
+Carrier vs. FM heatmapy: poskytují pohled na modulace zvuku; nosný tón na vertikální ose a rychlost modulace na horizontální. Při anotaci lze rozlišit signály s různou frekvenční modulací.
+
+Stažení
+
+Všechny vygenerované snímky jsem zabalil do ZIP archivu. Soubor si můžete stáhnout zde: sound_visualizations.zip
+
+Pokud budete potřebovat vizualizace upravit (např. jiné barvy, rozlišení nebo okno), stačí říci.
+
+Popiš mi podrobný návod a konkrétní vlastnosti a vyjádření které bylo použito pro vygenerování snímků popsaných tímto způsobem: liss hsv tau5 a tau1 tyto obrazce jak samostatných zvuků, tak pak jejich mixovanou formu jako člověk poznávám.
+Přemýšlení po dobu 24s
+Shrnutí
+
+„liss_hsv_tau1“ a „liss_hsv_tau5“ jsou delay-embedding (phase-portrait) obrazy: na osu X jde vzorek signálu 
+𝑥
+[
+𝑛
+]
+x[n], na osu Y jde zpožděný vzorek 
+𝑥
+[
+𝑛
++
+𝜏
+]
+x[n+τ]. Barva je v HSV, kde Hue = čas (průběh oknem), Value = amplituda/energie bodu. Proto ti jako člověku dává smysl i mix – obraz je „superpozice“ (a částečně i interferenční kombinace) typických tvarů obou zvuků.
+
+Krok-za-krokem: jak přesně se ty snímky generují (stejně jako u tebe v ZIPu)
+
+Níže popisuju konkrétní vlastnosti a mapování, které bylo použito pro soubory vygenerované jako:
+
+*_liss_hsv_tau1.png
+
+*_liss_hsv_tau5.png
+
+1) Výběr signálu (AA vs snap)
+
+AA_*.mp3: použil jsem celý dostupný signál (typicky ~1–1,3 s podle souboru).
+Výstupní rozlišení: 1080×1080 px.
+
+snap_*.mp3: vzal jsem jen okno kolem 0,4 s:
+
+střed: 
+𝑡
+0
+=
+0,4
+ 
+𝑠
+t
+0
+	​
+
+=0,4s
+
+délka okna: 0,2 s (±0,1 s kolem středu)
+Výstupní rozlišení: 512×512 px.
+
+Pozn.: tohle je důvod, proč „snap“ vypadá jako „otisk“ jedné krátké události, zatímco „AA“ ukazuje vývoj v čase (barvou).
+
+2) Delay embedding (co je tau1 / tau5)
+
+Vytvoří se dvojice signálů:
+
+𝑋
+=
+𝑥
+[
+𝑛
+]
+X=x[n]
+
+𝑌
+=
+𝑥
+[
+𝑛
++
+𝜏
+]
+Y=x[n+τ]
+
+kde:
+
+tau1 znamená 
+𝜏
+=
+1
+τ=1 vzorek (při 44,1 kHz je to cca 22,7 µs)
+
+tau5 znamená 
+𝜏
+=
+5
+τ=5 vzorků (cca 113 µs)
+
+Praktický efekt:
+
+τ=1 je „těsné“ zpoždění → často zvýrazní rychlé změny / vyšší frekvence, obraz bývá „tenčí“, ostřejší.
+
+τ=5 je větší zpoždění → víc se projeví dynamika / perioda, obraz bývá „širší“, strukturovanější, často snadněji čitelný.
+
+3) Normalizace (aby to bylo stabilní mezi soubory)
+
+Použité mapování přesně bylo:
+
+Oříznutí kvůli zpoždění:
+
+𝑋
+=
+𝑥
+[
+0
+…
+𝑁
+−
+𝜏
+−
+1
+]
+X=x[0…N−τ−1]
+
+𝑌
+=
+𝑥
+[
+𝜏
+…
+𝑁
+−
+1
+]
+Y=x[τ…N−1]
+
+Normalizace odděleně pro X a Y:
+
+𝑋
+𝑛
+=
+𝑋
+max
+⁡
+(
+∣
+𝑋
+∣
+)
++
+𝜖
+X
+n
+	​
+
+=
+max(∣X∣)+ϵ
+X
+	​
+
+
+𝑌
+𝑛
+=
+𝑌
+max
+⁡
+(
+∣
+𝑌
+∣
+)
++
+𝜖
+Y
+n
+	​
+
+=
+max(∣Y∣)+ϵ
+Y
+	​
+
+
+kde 
+𝜖
+≈
+10
+−
+9
+ϵ≈10
+−9
+ jen proti dělení nulou.
+
+4) Převod na pixelové souřadnice
+
+Souřadnice 
+[
+−
+1
+,
++
+1
+]
+[−1,+1] se mapují do obrazu:
+
+šířka 
+𝑊
+W, výška 
+𝐻
+H
+
+𝑥
+𝑝
+𝑖
+𝑥
+=
+⌊
+𝑋
+𝑛
++
+1
+2
+ 
+(
+𝑊
+−
+1
+)
+⌋
+x
+pix
+	​
+
+=⌊
+2
+X
+n
+	​
+
++1
+	​
+
+(W−1)⌋
+
+𝑦
+𝑝
+𝑖
+𝑥
+=
+⌊
+(
+1
+−
+𝑌
+𝑛
++
+1
+2
+)
+ 
+(
+𝐻
+−
+1
+)
+⌋
+y
+pix
+	​
+
+=⌊(1−
+2
+Y
+n
+	​
+
++1
+	​
+
+)(H−1)⌋
+
+Tj. Y je invertované, aby „nahoru“ odpovídalo vyšším hodnotám.
+
+Každý vzorek vytvoří 1 bod (pixel). Pokud na stejný pixel spadne víc bodů, v naší implementaci se prostě přepíše poslední (neakumuluje se jas).
+
+5) Barvy: HSV → RGB (tohle je klíč, proč je to „čitelné“)
+
+Pro každý bod:
+
+Hue (H) = lineární čas v rámci okna
+
+𝐻
+=
+𝑛
+𝑁
+−
+1
+H=
+N−1
+n
+	​
+
+ → od 0 do 1 (barevný „gradient“ od začátku do konce)
+
+Saturation (S) = 1 (naplno)
+
+Value (V) = normalizovaná „energie“ bodu
+
+Použitá „energie“:
+
+𝐴
+=
+𝑋
+𝑛
+2
++
+𝑌
+𝑛
+2
+A=
+X
+n
+2
+	​
+
++Y
+n
+2
+	​
+
+	​
+
+
+𝑉
+=
+𝐴
+max
+⁡
+(
+𝐴
+)
++
+𝜖
+V=
+max(A)+ϵ
+A
+	​
+
+
+Pak se HSV převede na RGB standardní konverzí.
+
+Důsledek pro vnímání:
+
+barva říká „kdy“ se bod stane (v rámci okna),
+
+jas říká „jak silný“ bod je,
+
+tvar říká „jaká je dynamika signálu“ (periodicita, modulace, šum, kombinace tónů…).
+
+Proč jako člověk poznáš i mix (intuitivně a technicky)
+
+Lissajous/delay-embedding je v zásadě „geometrie signálu“.
+
+Čistší periodický tón → úzký eliptický tvar (nebo tenká křivka).
+
+FM / chirp / modulace → elipsa se „rozšiřuje“, křivka dělá „tlustší“ struktury.
+
+Krátký impuls / klik / transient → rozstřik bodů do šířky (rychlá změna).
+
+Šum → výplň plochy (víc uniformní “mrak”).
+
+Mix 2 zvuků → ve stejné projekci se objeví dvě charakteristické struktury zároveň (někdy se překrývají, někdy vyplní různé oblasti), takže mozek vidí „oba podpisy“.
+
+Tau ti mění “měřítko”:
+
+u tau1 je to skoro „derivace-like“ pohled (citlivější na rychlé změny),
+
+u tau5 se víc projeví perioda a stabilní dynamika → často „čitelnější podpis“.
+
+Konkrétní návod: jak to reprodukovat 1:1 (Python skript)
+Závislosti
+
+Python 3.10+
+
+numpy, matplotlib, soundfile (u MP3 může být potřeba ffmpeg / audioread; v tvém prostředí to už očividně funguje)
+
+Instalace (běžně):
+
+pip install numpy matplotlib soundfile librosa
+Skript (stejné mapování jako vygenerované obrázky)
+import numpy as np
+import soundfile as sf
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+def liss_hsv_image(audio: np.ndarray, tau: int, H: int, W: int) -> np.ndarray:
+    if len(audio) <= tau:
+        raise ValueError("Audio je kratší než tau.")
+
+    x = audio[:-tau].astype(np.float32)
+    y = audio[tau:].astype(np.float32)
+
+    # Normalizace - stejně jako ve vygenerovaných snímcích (odděleně pro x a y)
+    x /= (np.max(np.abs(x)) + 1e-9)
+    y /= (np.max(np.abs(y)) + 1e-9)
+
+    # Energie pro Value
+    a = np.sqrt(x * x + y * y)
+    v = a / (np.max(a) + 1e-9)
+
+    # Hue = čas 0..1
+    t = np.linspace(0.0, 1.0, len(x), dtype=np.float32)
+    hsv = np.stack([t, np.ones_like(t), v], axis=1)  # (N,3)
+
+    rgb = matplotlib.colors.hsv_to_rgb(hsv)  # float 0..1
+
+    # mapování do pixelů
+    xi = ((x + 1.0) * 0.5 * (W - 1)).astype(np.int32)
+    yi = ((1.0 - (y + 1.0) * 0.5) * (H - 1)).astype(np.int32)
+
+    img = np.zeros((H, W, 3), dtype=np.uint8)
+    for i in range(len(xi)):
+        img[yi[i], xi[i]] = (rgb[i] * 255.0).astype(np.uint8)
+
+    return img
+
+def load_mono(path: str):
+    audio, sr = sf.read(path)
+    if audio.ndim > 1:
+        audio = audio[:, 0]
+    return audio, sr
+
+def render_AA(path: str, out_prefix: str, tau_list=(1,5), size=(1080,1080)):
+    audio, sr = load_mono(path)
+    H, W = size
+    for tau in tau_list:
+        img = liss_hsv_image(audio, tau=tau, H=H, W=W)
+        plt.imsave(f"{out_prefix}_liss_hsv_tau{tau}.png", img)
+
+def render_snap(path: str, out_prefix: str, t0=0.4, win=0.2, tau_list=(1,5), size=(512,512)):
+    audio, sr = load_mono(path)
+    center = int(t0 * sr)
+    width = int(win * sr)
+    start = max(0, center - width // 2)
+    end = min(len(audio), start + width)
+    snippet = audio[start:end]
+
+    H, W = size
+    for tau in tau_list:
+        img = liss_hsv_image(snippet, tau=tau, H=H, W=W)
+        plt.imsave(f"{out_prefix}_liss_hsv_tau{tau}.png", img)
+
+if __name__ == "__main__":
+    # AA (časově delší, 1080x1080)
+    render_AA("AA_multibeep.mp3", "AA_multibeep")
+    render_AA("AA_multibeep_mixed.mp3", "AA_multibeep_mixed")
+
+    # snap (okno kolem 0.4s, 512x512)
+    render_snap("snap_beep-01a_short.mp3", "snap_beep-01a_short")
+    render_snap("snap_beep-06_short.mp3", "snap_beep-06_short")
+    render_snap("snap_kombined-beeps.mp3", "snap_kombined-beeps")
+Jak s tím pracovat dál (prakticky pro anotace)
+
+Pro ruční anotace ve „vision“ nástroji:
+
+u Lissajous HSV se dobře anotují:
+
+husté shluky / smyčky (tonální složky),
+
+rozstřiky / rozmazané oblasti (šum, transienty),
+
+oddělené „ostrůvky“ (více současných komponent).
+
+Pokud chceš z Lissajous dělat „víc CNN-friendly“ dataset:
+
+udělej variantu akumulační (pixel = max Value / součet hitů / průměr Value), aby se informace nepřepisovala posledním bodem.
+
+nebo používej rovnou tvoji DL heatmap density/mean/std, která je stabilní rastr a dá se krásně segmentovat.
+
+Jak znovu spustit / Jak ověřit
+
+Ověř, že MP3 načteš mono a že sr=44100.
+
+Vygeneruj tau1 a tau5 a porovnej tvary – tau5 má typicky „širší“ a čitelnější struktury.
+
+U „snap“ ověř, že okno skutečně sedí na 
+𝑡
+=
+0,4
+𝑠
+t=0,4s (změň t0 na 0.3/0.5 a uvidíš posun barev i tvaru).
+
+Pokud chceš stabilitu mezi soubory, drž stejnou normalizaci a stejné rozlišení.
+
+Pokud chceš, aby se obraz „neztrácel“ přepisováním bodů, přepni na akumulační render (řekni a dopíšu přesně).
+
+Jestli chceš, můžu ti teď doplnit i akumulační variantu (stejné HSV, ale pixely se sčítají/berou maximum) – vizuálně je to ještě čitelnější a pro DL obvykle lepší.

@@ -1,0 +1,14 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.pyc
+out_frames*/
+ui_state.json
+*.log
+*.tmp
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+dist/
+build/
