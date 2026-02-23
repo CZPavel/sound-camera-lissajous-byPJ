@@ -10,6 +10,7 @@
   - `AudioRingBuffer`
   - `WasapiLoopbackSource`, `WavSource`, `SineSource`
   - device listing + default output resolution
+  - backend order for loopback capture (`pyaudiowpatch` first, `sounddevice` fallback)
 - `src/liss_render.py`
   - delay-embedding rendering
   - point brush expansion + overlap accumulation
@@ -65,7 +66,20 @@
 - Silence-safe normalization (`+1e-9`) avoids NaN/Inf.
 - Headless mode enables deterministic automated smoke tests.
 
-## 5. Known constraints
+## 5. Loopback backend selection
+
+When `--source loopback` is used, runtime selects audio backend in this order:
+
+1. `pyaudiowpatch` WASAPI loopback endpoint
+- maps the selected/default Windows output endpoint to its loopback analogue,
+- captures currently playing system audio from speakers/headphones endpoint.
+2. `sounddevice` legacy path
+- uses direct WASAPI loopback flag when available in the local PortAudio build,
+- otherwise attempts an input loopback-like device (Stereo Mix style fallback).
+
+This order prevents the common host-specific issue where loopback capture silently lands on microphone-style inputs.
+
+## 6. Known constraints
 
 - WASAPI behavior differs across PortAudio builds; fallback path may use "Stereo Mix" style input when direct loopback flag is unavailable.
 - High resolutions + large brush size + `sum/avg` modes increase CPU and memory bandwidth demands.

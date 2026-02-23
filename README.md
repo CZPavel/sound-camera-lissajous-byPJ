@@ -40,6 +40,7 @@ python src/main.py --source sine --headless true --max-frames 20
 ## Core capabilities
 
 - Audio sources: `loopback`, `wav`, `sine`
+- Loopback backend preference: `pyaudiowpatch` WASAPI loopback endpoint for current Windows default output, with `sounddevice` legacy fallback
 - Tau modes: `1`, `5`, `10`, `20`, `50`, `both`
 - Point rendering: `classic`, `sharp_stamp`, `square_stamp`
 - Value modes: `radial`, `flat`
@@ -77,6 +78,11 @@ python src/main.py --source sine --headless true --max-frames 20
 pytest -q
 python src/gui.py --smoke
 ```
+
+## Audio backend note
+
+- The default `loopback` path now targets the active Windows output endpoint (speakers/headphones) via `pyaudiowpatch`.
+- If this path is unavailable on a host, runtime falls back to the legacy `sounddevice` path.
 
 ---
 

@@ -7,6 +7,7 @@ import threading
 import time
 import wave
 from abc import ABC, abstractmethod
+from typing import Any
 
 import numpy as np
 
@@ -98,6 +99,16 @@ def _require_sounddevice():
             "Missing dependency 'sounddevice'. Install requirements.txt first."
         ) from exc
     return sd
+
+
+def _require_pyaudiowpatch():
+    try:
+        import pyaudiowpatch as pyaudio  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Missing dependency 'pyaudiowpatch'. Install requirements.txt first."
+        ) from exc
+    return pyaudio
 
 
 def list_audio_devices() -> list[dict]:
@@ -200,6 +211,8 @@ class WasapiLoopbackSource(AudioSourceBase):
 
         self._ring: AudioRingBuffer | None = None
         self._stream = None
+        self._pyaudio = None
+        self._pa_ctx = None
         self._last_underrun_print = 0.0
 
     @staticmethod
@@ -262,7 +275,112 @@ class WasapiLoopbackSource(AudioSourceBase):
 
         raise RuntimeError(f"Cannot resolve output device from '{self.device}'.")
 
-    def start(self) -> None:
+    def _resolve_loopback_device_info(self, pa) -> dict[str, Any]:
+        if str(self.device).lower() == "default":
+            # Primary behavior: map current default Windows output to its loopback endpoint.
+            try:
+                out_idx = self._resolve_output_device_index()
+                dev = dict(pa.get_wasapi_loopback_analogue_by_index(int(out_idx)))
+                self.output_device_index = int(out_idx)
+                return dev
+            except Exception:
+                pass
+            dev = dict(pa.get_default_wasapi_loopback())
+            try:
+                self.output_device_index = int(dev.get("index", -1))
+            except Exception:
+                self.output_device_index = -1
+            return dev
+
+        # Numeric input can be either loopback endpoint index or output device index.
+        try:
+            idx = int(self.device)
+            try:
+                dev = dict(pa.get_device_info_by_index(idx))
+                if bool(dev.get("isLoopbackDevice", False)):
+                    self.output_device_index = int(idx)
+                    return dev
+            except Exception:
+                pass
+            dev = dict(pa.get_wasapi_loopback_analogue_by_index(idx))
+            self.output_device_index = int(idx)
+            return dev
+        except ValueError:
+            pass
+
+        needle = str(self.device).lower().strip()
+        loopbacks = [dict(dev) for dev in pa.get_loopback_device_info_generator()]
+        for dev in loopbacks:
+            if needle in str(dev.get("name", "")).lower():
+                return dev
+
+        # Last chance: name match on output then map to loopback.
+        devices = self._sd.query_devices()
+        for idx, dev in enumerate(devices):
+            if int(dev.get("max_output_channels", 0)) <= 0:
+                continue
+            if needle not in str(dev.get("name", "")).lower():
+                continue
+            try:
+                mapped = dict(pa.get_wasapi_loopback_analogue_by_index(idx))
+                self.output_device_index = int(idx)
+                return mapped
+            except Exception:
+                continue
+
+        raise RuntimeError(f"Cannot resolve loopback device from '{self.device}'.")
+
+    def _start_with_pyaudiowpatch(self) -> None:
+        self._pyaudio = _require_pyaudiowpatch()
+        self._pa_ctx = self._pyaudio.PyAudio()
+        try:
+            stream_dev = self._resolve_loopback_device_info(self._pa_ctx)
+            max_capture_channels = int(stream_dev.get("maxInputChannels", 0))
+            if max_capture_channels <= 0:
+                raise RuntimeError("Selected loopback endpoint has zero input channels.")
+
+            self.sample_rate = int(
+                round(self.requested_sample_rate or float(stream_dev.get("defaultSampleRate", 48000.0)))
+            )
+            self.channels = int(self.requested_channels or min(2, max_capture_channels))
+            self.channels = max(1, min(self.channels, max_capture_channels))
+
+            capacity_samples = max(1024, int(self.sample_rate * self.buffer_seconds))
+            self._ring = AudioRingBuffer(capacity_samples=capacity_samples, channels=self.channels)
+
+            def callback(in_data, frame_count, _time_info, _status):
+                arr = np.frombuffer(in_data, dtype=np.float32)
+                if self.channels > 1:
+                    arr = arr.reshape(-1, self.channels)
+                else:
+                    arr = arr.reshape(-1, 1)
+                if self._ring is not None:
+                    self._ring.write(arr)
+                return (None, self._pyaudio.paContinue)
+
+            self._stream = self._pa_ctx.open(
+                format=self._pyaudio.paFloat32,
+                channels=self.channels,
+                rate=self.sample_rate,
+                input=True,
+                frames_per_buffer=1024 if self.blocksize <= 0 else self.blocksize,
+                input_device_index=int(stream_dev["index"]),
+                stream_callback=callback,
+                start=True,
+            )
+
+            print(
+                "[INFO] Loopback started | "
+                "mode='WASAPI loopback (pyaudiowpatch)' "
+                f"output_device={self.output_device_index} "
+                f"capture_device={int(stream_dev.get('index', -1))} capture_name='{stream_dev.get('name', '')}' "
+                f"sr={self.sample_rate} channels={self.channels} ring_capacity={capacity_samples}"
+            )
+        except Exception:
+            self.stop()
+            raise
+
+    def _start_with_sounddevice_legacy(self) -> None:
         if not hasattr(self._sd, "WasapiSettings"):
             raise RuntimeError("Current sounddevice build has no WasapiSettings support.")
 
@@ -288,19 +406,16 @@ class WasapiLoopbackSource(AudioSourceBase):
         if supports_loopback_kw:
             stream_device_index = self.output_device_index
             stream_dev = output_dev
-            capture_mode = "WASAPI loopback"
+            capture_mode = "WASAPI loopback (sounddevice)"
             extra_settings = self._sd.WasapiSettings(loopback=True)
             max_capture_channels = int(stream_dev.get("max_output_channels", 0))
         else:
-            # sounddevice/PortAudio build does not expose loopback flag.
-            # Try to use an input loopback-like device (e.g. Stereo Mix) as fallback path.
             alt_input_idx = self._find_input_loopback_candidate(self.output_device_index)
             if alt_input_idx is None:
                 raise RuntimeError(
                     "WASAPI loopback flag is unavailable in this sounddevice build and no "
                     "input loopback candidate (e.g. Stereo Mix) was found."
                 )
-
             stream_device_index = alt_input_idx
             stream_dev = self._sd.query_devices(stream_device_index)
             capture_mode = "Input fallback (Stereo Mix / loopback-like)"
@@ -337,13 +452,44 @@ class WasapiLoopbackSource(AudioSourceBase):
             f"sr={self.sample_rate} channels={self.channels} ring_capacity={capacity_samples}"
         )
 
+    def start(self) -> None:
+        errors: list[str] = []
+        try:
+            self._start_with_pyaudiowpatch()
+            return
+        except Exception as exc:
+            errors.append(f"pyaudiowpatch path failed: {exc}")
+
+        try:
+            self._start_with_sounddevice_legacy()
+            return
+        except Exception as exc:
+            errors.append(f"sounddevice path failed: {exc}")
+            self.stop()
+            raise RuntimeError("Cannot start loopback source.\n" + "\n".join(errors))
+
     def stop(self) -> None:
         if self._stream is not None:
             try:
-                self._stream.stop()
-                self._stream.close()
+                if hasattr(self._stream, "is_active"):
+                    if self._stream.is_active():
+                        self._stream.stop_stream()
+                else:
+                    self._stream.stop()
+            except Exception:
+                pass
+            try:
+                if hasattr(self._stream, "close"):
+                    self._stream.close()
             finally:
                 self._stream = None
+        if self._pa_ctx is not None:
+            try:
+                self._pa_ctx.terminate()
+            except Exception:
+                pass
+            self._pa_ctx = None
+            self._pyaudio = None
 
     def get_window(self, num_samples: int) -> np.ndarray:
         if self._ring is None:

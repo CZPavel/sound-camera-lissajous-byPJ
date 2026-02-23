@@ -13,6 +13,12 @@ pip install -r requirements.txt
 - Keep `--fallback-on-fail true`
 - Provide `--wav-path` for deterministic fallback
 
+Additional checks for Windows output capture:
+- Verify the active default playback endpoint in Windows Sound settings.
+- Confirm that dependency `pyaudiowpatch` is installed from `requirements.txt`.
+- In logs, prefer `mode='WASAPI loopback (pyaudiowpatch)'` for primary output capture.
+- If the host does not support that path, the app can still run through legacy fallback, but capture source may differ by driver stack.
+
 ## 3. Image does not change
 - Confirm system audio is actually playing on selected output endpoint.
 - Lower `--fps` or adjust `--window-ms`.
@@ -32,3 +38,12 @@ Reduce one or more of:
 - `point-size-step`
 - `fps`
 - accumulation complexity (`avg`/`sum`)
+
+## 7. App reacts only to microphone-like input
+This usually indicates fallback to a non-loopback input route on the host.
+
+Recommended actions:
+- Keep `--source loopback` and set `--device default` first.
+- Switch Windows default output to the endpoint you actually monitor (speakers/headphones), then restart app.
+- Reinstall dependencies and verify `pyaudiowpatch` import works.
+- Use `python src/main.py --list-devices` and retest with explicit output device index.

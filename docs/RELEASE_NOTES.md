@@ -1,5 +1,16 @@
 # Release Notes
 
+## 0.2.1 - Loopback stabilization update
+
+### Highlights
+- `WasapiLoopbackSource` now prefers `pyaudiowpatch` for Windows WASAPI loopback endpoint capture.
+- Default `loopback` behavior targets currently active Windows output endpoint (speakers/headphones).
+- Legacy `sounddevice` route is retained as fallback for host compatibility.
+- Documentation updates for backend behavior and troubleshooting.
+
+### Dependency updates
+- Added runtime dependency: `pyaudiowpatch>=0.2.12.8`
+
 ## 0.2.0 - Documentation and handover release
 
 This release focuses on transferability and long-term maintainability.
